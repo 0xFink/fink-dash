@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en"><head><script>/* ui-accel */(function(CFG){
+    if(window.__accel){ if(CFG.gated) window.__gated=true; return; }
+    window.__accel=1; if(CFG.gated) window.__gated=true;
+    var G=4000, READAHEAD=6, LIVE_MS=20000;
+    var of=window.fetch.bind(window);
+    function resp(obj,status){ status=status||200;
+      return {ok:status<300,status:status,headers:{get:function(){return 'application/json'}},
+        json:function(){return Promise.resolve(obj)},text:function(){return Promise.resolve(JSON.stringify(obj))},clone:function(){return resp(obj,status)}}; }
+    function hex(n){ return '0x'+n.toString(16); }
+    function rpc(m,p){ return of(CFG.rpc,{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:m,params:p})})
+      .then(function(r){ if(!r.ok) throw new Error('http '+r.status); return r.json(); })
+      .then(function(j){ if(j.error) throw new Error(j.error.message); return j.result; }); }
+
+    var bn=null, bnT=0;
+    function blockNumber(){ if(bn&&Date.now()-bnT<3000) return bn; bnT=Date.now();
+      bn=rpc('eth_blockNumber',[]).then(function(h){ return parseInt(h,16); },function(e){ bn=null; throw e; }); return bn; }
+    var blocks={};
+
+    var caches={}; // filter key -> {chunks:{idx:{p,logs,t,full}}}
+    function chunk(key,filter,i,latest){
+      var c=caches[key]||(caches[key]={chunks:{}}), e=c.chunks[i];
+      var top=(i+1)*G-1>=latest;
+      if(e&&(e.full||Date.now()-e.t<LIVE_MS)) return e.p;
+      var from=i*G, to=Math.min((i+1)*G-1,latest);
+      var ent={t:Date.now(),full:!top};
+      ent.p=rpc('eth_getLogs',[{address:filter.address,topics:filter.topics,fromBlock:hex(from),toBlock:hex(to)}])
+        .then(function(l){ return l; },function(err){ delete c.chunks[i]; throw err; });
+      c.chunks[i]=ent; return ent.p;
+    }
+    function getLogs(filter,from,to){
+      var key=JSON.stringify([String(filter.address).toLowerCase(),filter.topics]);
+      return blockNumber().then(function(latest){
+        if(to>latest) to=latest;
+        var a=Math.floor(from/G), b=Math.floor(to/G), need=[];
+        for(var i=a;i<=b;i++) need.push(chunk(key,filter,i,latest));
+        for(var k=1;k<=READAHEAD;k++) if(a-k>=0) chunk(key,filter,a-k,latest).catch(function(){});
+        return Promise.all(need).then(function(parts){
+          var out=[];
+          parts.forEach(function(l){ l.forEach(function(x){ var n=parseInt(x.blockNumber,16); if(n>=from&&n<=to) out.push(x); }); });
+          out.sort(function(x,y){ return parseInt(x.blockNumber,16)-parseInt(y.blockNumber,16)||parseInt(x.logIndex,16)-parseInt(y.logIndex,16); });
+          return out;
+        });
+      });
+    }
+
+    window.fetch=function(url,init){
+      try{
+        var u=typeof url==='string'?url:(url&&url.url)||'';
+        if(window.__gated&&/\/lp-config\.json(\?|$)/.test(u)) return Promise.resolve(resp({},404));
+        if(u===CFG.rpc&&init&&typeof init.body==='string'&&init.body.charAt(0)==='{'){
+          var b=JSON.parse(init.body), done=function(r){ return resp({jsonrpc:'2.0',id:b.id,result:r}); };
+          if(b.method==='eth_blockNumber') return blockNumber().then(function(n){ return done(hex(n)); }).catch(function(){ return of(url,init); });
+          if(b.method==='eth_getBlockByNumber'&&/^0x[0-9a-f]+$/i.test(b.params[0])&&!b.params[1]){
+            var bk=b.params[0].toLowerCase();
+            if(!blocks[bk]) blocks[bk]=rpc('eth_getBlockByNumber',[bk,false]).catch(function(e){ delete blocks[bk]; throw e; });
+            return blocks[bk].then(done).catch(function(){ return of(url,init); });
+          }
+          if(b.method==='eth_getLogs'){
+            var f=b.params[0], fr=parseInt(f.fromBlock,16), to=parseInt(f.toBlock,16);
+            if(f.address&&f.topics&&isFinite(fr)&&isFinite(to)&&to-fr<=2*G)
+              return getLogs(f,fr,to).then(done).catch(function(){ return of(url,init); });
+          }
+        }
+      }catch(e){}
+      return of(url,init);
+    };
+
+    // PBKDF2 memo
+    try{
+      var S=crypto.subtle, oImp=S.importKey.bind(S), oDer=S.deriveKey.bind(S), oBits=S.deriveBits.bind(S), pw=new WeakMap();
+      var b64=function(buf){ var s='',a=new Uint8Array(buf); for(var i=0;i<a.length;i++) s+=String.fromCharCode(a[i]); return btoa(s); };
+      var unb64=function(s){ return Uint8Array.from(atob(s),function(c){ return c.charCodeAt(0); }); };
+      var bytes=function(d){ return d instanceof ArrayBuffer?new Uint8Array(d):new Uint8Array(d.buffer,d.byteOffset,d.byteLength); };
+      S.importKey=function(fmt,data,alg,ext,uses){
+        var name=alg&&(alg.name||alg);
+        if(fmt==='raw'&&name==='PBKDF2'){
+          var raw=bytes(data).slice();
+          return oImp(fmt,raw,alg,false,['deriveKey','deriveBits']).then(function(k){ pw.set(k,raw); return k; });
+        }
+        return oImp(fmt,data,alg,ext,uses);
+      };
+      S.deriveKey=function(alg,base,dAlg,ext,uses){
+        if(!(alg&&alg.name==='PBKDF2'&&pw.has(base))) return oDer(alg,base,dAlg,ext,uses);
+        var p=pw.get(base), s=bytes(alg.salt), meta=new TextEncoder().encode('|'+alg.iterations+'|'+(alg.hash.name||alg.hash)+'|'+(dAlg.length||256)+'|');
+        var all=new Uint8Array(p.length+s.length+meta.length); all.set(p,0); all.set(s,p.length); all.set(meta,p.length+s.length);
+        return S.digest('SHA-256',all).then(function(h){
+          var id='accel.k.'+b64(h), hit=null; try{ hit=sessionStorage.getItem(id); }catch(e){}
+          var bitsP=hit?Promise.resolve(unb64(hit)):oBits(alg,base,dAlg.length||256).then(function(bits){ try{ sessionStorage.setItem(id,b64(bits)); }catch(e){} return new Uint8Array(bits); });
+          return bitsP.then(function(bits){ return oImp('raw',bits,dAlg,ext,uses); });
+        });
+      };
+    }catch(e){}
+  })({"rpc":"https://rpc.mainnet.chain.robinhood.com","gated":true});</script><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Locked</title>
+<style>
+html,body{margin:0;height:100%;background:#07040f;color:#f3e9ff;
+ font:500 15px/1.5 ui-monospace,Menlo,monospace;display:grid;place-items:center}
+.b{width:min(92vw,340px);text-align:center}
+h1{font-size:15px;letter-spacing:.22em;color:#ff6ad5;margin:0 0 18px;font-weight:700}
+input{width:100%;background:rgba(0,0,0,.5);border:1px solid rgba(190,120,255,.4);
+ color:#f3e9ff;border-radius:3px;padding:12px;font:600 17px ui-monospace,Menlo,monospace;text-align:center}
+button{width:100%;margin-top:10px;padding:12px;border-radius:3px;border:1px solid #4dff9e;
+ background:rgba(77,255,158,.14);color:#4dff9e;font:700 15px ui-monospace,Menlo,monospace;cursor:pointer}
+#m{margin-top:12px;font-size:12px;color:#ff5d8f;min-height:18px}
+</style></head><body>
+<div class="b">
+<h1>SAFE // LOCKED</h1>
+<input id="p" type="password" autocomplete="current-password" placeholder="password" autofocus>
+<button id="go">UNLOCK</button>
+<div id="m"></div>
+</div>
+<script>
+/* EVERYTHING HERE IS SCOPED. document.open() does NOT clear the global scope,
+   so any global this loader declares survives into the decrypted page. A bare
+   a bare var D for the ciphertext collided with the portfolio page's own const D
+   and killed its entire script with "Identifier 'D' has already been declared"
+   — the page unlocked but every panel below the fold rendered empty. */
+(function(){
+var S="OpQzAATmPW4dVyCf/xEJYQ==",IV="OKJ+zD6ztk8CibnV",D="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",IT=250000;
+function b2a(b){return Uint8Array.from(atob(b),function(c){return c.charCodeAt(0)})}
+function show(t){document.getElementById("m").textContent=t}
+async function keyFrom(pw){
+ var km=await crypto.subtle.importKey("raw",new TextEncoder().encode(pw),{name:"PBKDF2"},false,["deriveKey"]);
+ return crypto.subtle.deriveKey({name:"PBKDF2",salt:b2a(S),iterations:IT,hash:"SHA-256"},
+   km,{name:"AES-GCM",length:256},true,["decrypt"]);
+}
+async function openWith(key){
+ var pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:b2a(IV)},key,b2a(D));
+ var html=new TextDecoder().decode(pt);
+ // full re-parse so inline scripts actually run
+ document.open(); document.write(html); document.close();
+}
+async function tryPw(pw,remember){
+ show("unlocking\u2026");
+ try{
+  var key=await keyFrom(pw);
+  await openWith(key);
+  if(remember) try{sessionStorage.setItem("sk",pw)}catch(e){}
+ }catch(e){ show("wrong password"); document.getElementById("p").value=""; }
+}
+document.getElementById("go").onclick=function(){tryPw(document.getElementById("p").value,true)};
+document.getElementById("p").addEventListener("keydown",function(e){if(e.key==="Enter")tryPw(e.target.value,true)});
+// already unlocked this session? go straight in
+(function(){var pw=null;try{pw=sessionStorage.getItem("sk")}catch(e){}
+ if(pw) tryPw(pw,false);})();
+})();
+</script></body></html>
